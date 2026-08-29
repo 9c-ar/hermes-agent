@@ -1282,6 +1282,68 @@ def clear_session_cwd(session_key: str) -> None:
     with _session_cwd_lock:
         _session_cwd.pop(session_key, None)
 
+def _probe_git_meta(cwd: str) -> tuple:
+    """Best-effort ``(git_branch, git_repo_root)`` probe for *cwd*.
+
+    Synchronous with a short timeout — the command already returned, but the
+    probe must never hold the terminal tool hostage on a wedged repo. Any
+    failure yields ``(None, None)``; the DB write treats empty as "don't
+    clobber" so a previously-captured repo identity survives.
+    """
+    branch = root = None
+    try:
+        out = subprocess.run(
+            ["git", "-C", cwd, "rev-parse", "--show-toplevel"],
+            capture_output=True, text=True, timeout=2,
+        )
+        if out.returncode == 0:
+            root = out.stdout.strip()
+            out = subprocess.run(
+                ["git", "-C", cwd, "rev-parse", "--abbrev-ref", "HEAD"],
+                capture_output=True, text=True, timeout=2,
+            )
+            if out.returncode == 0:
+                branch = out.stdout.strip()
+    except Exception:
+        pass
+    return branch, root
+
+
+def persist_gateway_session_cwd_to_db(session_key: str, cwd: str) -> None:
+    """Dual-write a gateway session's cwd to ``state.db`` (best-effort).
+
+    The in-memory ``record_session_cwd`` above keeps the durable cwd out of
+    the shared env, but messaging-gateway sessions (Telegram/Discord/Slack/…)
+    also need the ``sessions`` row updated: the Projects sidebar groups rows
+    by ``cwd``/``git_repo_root``, and only CLI/TUI persisted it so far —
+    gateway chats always grouped under the launch dir. See ``#29531``.
+
+    Scope guard: only ``agent:``-prefixed keys. CLI keys collapse to
+    ``"default"`` (or ``cli:…``) and TUI persists through its own turn-
+    boundary path; letting either through here would double-write.
+
+    Never raises: a DB write failure must not fail the user's command.
+    """
+    if not session_key or not str(session_key).startswith("agent:"):
+        return
+    try:
+        from hermes_state import SessionDB
+        from hermes_cli.config import get_hermes_home
+
+        git_branch, git_repo_root = _probe_git_meta(cwd)
+        db = SessionDB(db_path=Path(get_hermes_home()) / "state.db")
+        try:
+            db.update_session_cwd_by_session_key(
+                session_key,
+                cwd,
+                git_branch=git_branch,
+                git_repo_root=git_repo_root,
+            )
+        finally:
+            db.close()
+    except Exception as exc:
+        logger.debug("persist session cwd to db failed: %s", exc)
+
 
 def register_task_env_overrides(task_id: str, overrides: Dict[str, Any]):
     """
@@ -3649,6 +3711,13 @@ def terminal_tool(
                 observed_cwd = (result or {}).get("cwd") or getattr(env, "cwd", None)
             if not workdir and observed_cwd:
                 record_session_cwd(session_key, observed_cwd)
+                # Gateway chats get the same durable persistence CLI/TUI
+                # already do, so the Projects sidebar can group them by
+                # project. Same guards as above: a transient workdir
+                # override or a command that never reported its cwd must
+                # not re-home the session row either.
+                if isinstance(observed_cwd, str) and observed_cwd.strip():
+                    persist_gateway_session_cwd_to_db(session_key, observed_cwd)
 
             # Extract output
             output = result.get("output", "")
