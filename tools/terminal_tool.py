@@ -3728,24 +3728,31 @@ def terminal_tool(
             # the last command to FINISH left there — on a shared env, that is
             # another session's directory. Recording it silently re-homes this
             # session into a directory the user never opened.
-            if not workdir and (result or {}).get("cwd_observed"):
-                new_cwd = getattr(env, "cwd", None)
+            observed_cwd = None
+            if (result or {}).get("cwd_observed"):
+                # New/current environments return the CWD observed by THIS
+                # command. The env field is shared mutable compatibility state
+                # and may already belong to a concurrent command. Keep the
+                # fallback for third-party providers that only implement the
+                # older cwd_observed + env.cwd contract.
+                observed_cwd = (result or {}).get("cwd") or getattr(env, "cwd", None)
+            if not workdir and observed_cwd:
                 # P2: the git probe runs two subprocesses with 2s timeouts —
                 # only pay it when the authoritative cwd actually moved.
                 # ``record_session_cwd`` returns the previous record so the
                 # first command of a session always persists, and later ones
                 # skip both the probe and the DB write while the session
                 # stays put.
-                prev_cwd = record_session_cwd(session_key, new_cwd)
-                cwd_moved = new_cwd != prev_cwd
+                prev_cwd = record_session_cwd(session_key, observed_cwd)
+                cwd_moved = observed_cwd != prev_cwd
                 # Gateway chats get the same durable persistence CLI/TUI
                 # already do, so the Projects sidebar can group them by
                 # project. Same guards as above: a transient workdir
                 # override or a command that never reported its cwd must
                 # not re-home the session row either.
-                if isinstance(new_cwd, str) and new_cwd.strip():
+                if isinstance(observed_cwd, str) and observed_cwd.strip():
                     persist_gateway_session_cwd_to_db(
-                        session_key, new_cwd, probe_git=cwd_moved
+                        session_key, observed_cwd, probe_git=cwd_moved
                     )
 
             # Extract output
@@ -3874,7 +3881,7 @@ def terminal_tool(
             # and tells the model it moved to a directory another session
             # opened.
             try:
-                post_cwd = getattr(env, "cwd", None) if (result or {}).get("cwd_observed") else None
+                post_cwd = observed_cwd
                 if post_cwd and command_cwd and os.path.realpath(str(post_cwd)) != os.path.realpath(str(command_cwd)):
                     result_dict["cwd"] = str(post_cwd)
             except Exception:
