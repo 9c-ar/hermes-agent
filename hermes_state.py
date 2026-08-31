@@ -7821,56 +7821,6 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
         return self._execute_write(_do)
 
-    def update_session_cwd_by_session_key(
-        self,
-        session_key: str,
-        cwd: str,
-        git_branch: Optional[str] = None,
-        git_repo_root: Optional[str] = None,
-        replace_git_meta: bool = False,
-    ) -> Optional[int]:
-        """Persist cwd for the session a gateway ``session_key`` currently points at.
-
-        Gateway rows (Telegram/Discord/Slack/...) mint timestamped uuid
-        ``id``s, so a caller holding only the routing key cannot reach
-        :meth:`update_session_cwd` directly. This resolves the key to the
-        row that key currently routes to — the still-open row, or the most
-        recently started one when every row for the key is closed — and
-        delegates. See :meth:`update_session_cwd` for the cwd/git contract.
-
-        Resolve-then-write is two transactions, so a concurrent reset that
-        closes the resolved row between the two writes lands the update on
-        the just-closed row. That is benign: the reset already minted the
-        successor row, and the next command's write claims it.
-        """
-        if not session_key or not cwd:
-            return None
-
-        def _resolve(conn):
-            row = conn.execute(
-                """
-                SELECT id FROM sessions
-                 WHERE session_key = ?
-                 ORDER BY (ended_at IS NULL) DESC, started_at DESC, id DESC
-                 LIMIT 1
-                """,
-                (session_key,),
-            ).fetchone()
-            if row is None:
-                return None
-            return row["id"] if isinstance(row, sqlite3.Row) else row[0]
-
-        session_id = self._execute_write(_resolve)
-        if not session_id:
-            return None
-        return self.update_session_cwd(
-            session_id,
-            cwd,
-            git_branch=git_branch,
-            git_repo_root=git_repo_root,
-            replace_git_meta=replace_git_meta,
-        )
-
     def publish_session_git_metadata(
         self,
         session_id: str,

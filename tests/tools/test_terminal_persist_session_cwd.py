@@ -5,6 +5,11 @@ CLI/TUI persisted it; messaging-gateway chats (``agent:…`` session keys)
 only tracked cwd in memory, so every Telegram/Discord/Slack chat grouped
 under the launch dir forever (#29531).
 
+Ownership is fenced to the EXACT durable ``HERMES_SESSION_ID`` that
+commissioned the terminal effect — never re-resolved from the stable
+``session_key`` after the effect completed (a reset reuses the key across
+durable session ids, so a stale effect must not re-home its successor).
+
 These tests drive the REAL ``tt.terminal_tool`` against a temp
 ``HERMES_HOME`` — never the user's database.
 """
@@ -16,6 +21,7 @@ import subprocess
 import pytest
 
 import tools.terminal_tool as tt
+from gateway.session_context import clear_session_vars, set_session_vars
 from hermes_state import SessionDB
 from tools.environments.local import LocalEnvironment
 
@@ -27,6 +33,7 @@ def _clean_store(monkeypatch, tmp_path):
     monkeypatch.setattr(tt, "_session_cwd", {})
     monkeypatch.setattr(tt, "_task_env_overrides", {})
     monkeypatch.delenv("TERMINAL_ENV", raising=False)
+    monkeypatch.delenv("HERMES_SESSION_ID", raising=False)
     # Route every DB write in this test into a throwaway HERMES_HOME.
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
 
@@ -59,7 +66,8 @@ def _row(tmp_path, session_id):
 
 
 class ToolDriver:
-    """Drive ``tt.terminal_tool`` with the real local env and cwd gates."""
+    """Drive ``tt.terminal_tool`` as the gateway would: with the session
+    context (routing key + durable session id) bound around the call."""
 
     def __init__(self, monkeypatch, env):
         monkeypatch.setattr(tt, "_active_environments", {"default": env})
@@ -73,15 +81,22 @@ class ToolDriver:
             tt, "_check_all_guards",
             lambda command, env_type, **kwargs: {"approved": True},
         )
-        self._monkeypatch = monkeypatch
         self._env = env
 
-    def run(self, command, task_id, timeout=None, workdir=None):
-        return json.loads(
-            tt.terminal_tool(
-                command=command, task_id=task_id, timeout=timeout, workdir=workdir
-            )
+    def run(self, command, task_id, timeout=None, workdir=None, session_id=None):
+        set_session_vars(
+            platform="telegram",
+            session_key=task_id,
+            session_id=session_id or task_id,
         )
+        try:
+            return json.loads(
+                tt.terminal_tool(
+                    command=command, task_id=task_id, timeout=timeout, workdir=workdir
+                )
+            )
+        finally:
+            clear_session_vars([])
 
 
 @pytest.fixture
@@ -108,7 +123,8 @@ class TestGatewaySessionsPersistCwd:
         repo = _git_repo(tmp_path / "projects" / "pet-app")
         _seed_session(tmp_path, "20260828_100000_abc12345", GATEWAY_KEY)
 
-        result = driver.run(f"cd {repo} && pwd", GATEWAY_KEY)
+        result = driver.run(f"cd {repo} && pwd", GATEWAY_KEY,
+                            session_id="20260828_100000_abc12345")
         assert result["exit_code"] == 0
 
         row = _row(tmp_path, "20260828_100000_abc12345")
@@ -121,9 +137,57 @@ class TestGatewaySessionsPersistCwd:
         """``agent:main`` style keys are gateway keys — pin the scope guard."""
         _seed_session(tmp_path, "row-short", "agent:main")
 
-        result = driver.run("pwd", "agent:main")
+        result = driver.run("pwd", "agent:main", session_id="row-short")
         assert result["exit_code"] == 0
         assert _row(tmp_path, "row-short")["cwd"] is not None
+
+
+class TestStaleCompletionFencing:
+    """P1: the write targets the exact durable session, never the key's
+    currently-open row. A stale effect from a reset conversation must be a
+    no-op for its successor."""
+
+    def test_stale_effect_does_not_rehome_successor(self, driver, tmp_path):
+        repo_old = _git_repo(tmp_path / "projects" / "old-work")
+        repo_new = _git_repo(tmp_path / "projects" / "new-work")
+
+        # S1 under K finishes a command in repo_old; its persistence is
+        # "in flight" (the effect commissioned by S1).
+        _seed_session(tmp_path, "row-old", GATEWAY_KEY)
+        driver.run(f"cd {repo_old} && pwd", GATEWAY_KEY, session_id="row-old")
+        assert os.path.realpath(
+            _row(tmp_path, "row-old")["cwd"]
+        ) == os.path.realpath(str(repo_old))
+
+        # Reset: /new closes S1 and mints S2 under the SAME key K.
+        db = _db(tmp_path)
+        db.end_session("row-old", "reset")
+        db.create_session("row-new", "telegram", session_key=GATEWAY_KEY)
+        db.close()
+
+        # The STALE S1 completion persists now, after the reset. It still
+        # runs inside S1's task context (that's what produced the effect),
+        # so the write must land on S1 (or be dropped), never re-home S2.
+        set_session_vars(
+            platform="telegram", session_key=GATEWAY_KEY, session_id="row-old"
+        )
+        try:
+            tt.persist_gateway_session_cwd_to_db(GATEWAY_KEY, str(repo_new))
+        finally:
+            clear_session_vars([])
+        assert _row(tmp_path, "row-new")["cwd"] is None
+        assert os.path.realpath(
+            _row(tmp_path, "row-old")["cwd"]
+        ) == os.path.realpath(str(repo_new))
+
+        # And the stale write must still not be able to touch S2 even when
+        # it carries a fresh cwd: ownership is by id, not by key.
+        result = driver.run(f"cd {repo_new} && pwd", GATEWAY_KEY,
+                            session_id="row-new")
+        assert result["exit_code"] == 0
+        assert os.path.realpath(
+            _row(tmp_path, "row-new")["cwd"]
+        ) == os.path.realpath(str(repo_new))
 
 
 class TestSkips:
@@ -132,26 +196,28 @@ class TestSkips:
         transient = tmp_path / "transient"
         transient.mkdir()
 
-        result = driver.run("pwd", GATEWAY_KEY, workdir=str(transient))
+        result = driver.run("pwd", GATEWAY_KEY, workdir=str(transient),
+                            session_id="row-workdir")
         assert result["exit_code"] == 0
         assert _row(tmp_path, "row-workdir")["cwd"] is None
 
     def test_interrupted_command_does_not_persist(self, driver, tmp_path):
         _seed_session(tmp_path, "row-interrupted", GATEWAY_KEY)
 
-        result = driver.run("sleep 20", GATEWAY_KEY, timeout=2)
+        result = driver.run("sleep 20", GATEWAY_KEY, timeout=2,
+                            session_id="row-interrupted")
         # Killed before the cwd marker: no observation, no persistence.
         assert result["exit_code"] != 0
         assert _row(tmp_path, "row-interrupted")["cwd"] is None
 
     def test_cli_session_key_does_not_persist(self, driver, tmp_path):
-        result = driver.run("pwd", "cli:default")
+        result = driver.run("pwd", "cli:default", session_id="row-cli")
         assert result["exit_code"] == 0
         # The scope guard declined before the write: no DB was ever opened.
         assert not (tmp_path / "state.db").exists()
 
     def test_tui_session_key_does_not_persist(self, driver, tmp_path):
-        result = driver.run("pwd", "tui:abc123")
+        result = driver.run("pwd", "tui:abc123", session_id="row-tui")
         assert result["exit_code"] == 0
         assert not (tmp_path / "state.db").exists()
 
@@ -166,8 +232,8 @@ class TestSharedEnvSafety:
         _seed_session(tmp_path, "row-a", key_a)
         _seed_session(tmp_path, "row-b", key_b)
 
-        driver.run(f"cd {repo_a} && pwd", key_a)
-        driver.run(f"cd {repo_b} && pwd", key_b)
+        driver.run(f"cd {repo_a} && pwd", key_a, session_id="row-a")
+        driver.run(f"cd {repo_b} && pwd", key_b, session_id="row-b")
 
         row_a = _row(tmp_path, "row-a")
         row_b = _row(tmp_path, "row-b")
@@ -183,7 +249,8 @@ class TestDegradedInputs:
         plain.mkdir()
         _seed_session(tmp_path, "row-plain", GATEWAY_KEY)
 
-        result = driver.run(f"cd {plain} && pwd", GATEWAY_KEY)
+        result = driver.run(f"cd {plain} && pwd", GATEWAY_KEY,
+                            session_id="row-plain")
         assert result["exit_code"] == 0
 
         row = _row(tmp_path, "row-plain")
@@ -198,10 +265,8 @@ class TestDegradedInputs:
         def _boom(*args, **kwargs):
             raise RuntimeError("database is locked")
 
-        monkeypatch.setattr(
-            SessionDB, "update_session_cwd_by_session_key", _boom
-        )
+        monkeypatch.setattr(SessionDB, "update_session_cwd", _boom)
 
-        result = driver.run("echo alive", GATEWAY_KEY)
+        result = driver.run("echo alive", GATEWAY_KEY, session_id="row-broken")
         assert result["exit_code"] == 0
         assert "alive" in result["output"]
