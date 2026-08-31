@@ -311,8 +311,13 @@ class OpenAICompatibleStreamer(StreamingTTSProvider):
         try:
             section = (_load_tts_config().get("openai_compatible") or {})
         except Exception:
-            return False
-        return bool(str(section.get("base_url") or "").strip())
+            section = {}
+        # Same resolution _base_url() will use at stream time — an env-only
+        # setup must not advertise a provider that can never stream.
+        return bool(
+            str(section.get("base_url") or "").strip()
+            or str(get_env_value("OPENAI_COMPATIBLE_TTS_BASE_URL") or "").strip()
+        )
 
     def _base_url(self) -> str:
         return str(
