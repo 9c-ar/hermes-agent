@@ -1248,7 +1248,9 @@ _session_cwd: Dict[str, str] = {}
 _session_cwd_lock = threading.Lock()
 
 
-def record_session_cwd(session_key: Optional[str], cwd: Optional[str]) -> None:
+def record_session_cwd(
+    session_key: Optional[str], cwd: Optional[str]
+) -> Optional[str]:
     """Record *cwd* as the working directory of *session_key*.
 
     Called wherever a session's live cwd becomes known: after a terminal
@@ -1256,13 +1258,19 @@ def record_session_cwd(session_key: Optional[str], cwd: Optional[str]) -> None:
     resulting cwd) and when a surface registers a workspace cwd override.
     Empty/None session keys collapse to ``"default"`` (single-session CLI).
     Non-string / empty cwds are ignored.
+
+    Returns the PREVIOUS record (``None`` when there was none or the input
+    was ignored) so callers can detect an actual cwd move without paying a
+    second lookup.
     """
     if not isinstance(cwd, str) or not cwd.strip():
-        return
+        return None
     key = str(session_key or "default")
     with _session_cwd_lock:
-        if _session_cwd.get(key) != cwd:
+        prev = _session_cwd.get(key)
+        if prev != cwd:
             _session_cwd[key] = cwd
+        return prev
 
 
 def get_session_cwd(session_key: Optional[str]) -> Optional[str]:
@@ -1309,7 +1317,7 @@ def _probe_git_meta(cwd: str) -> tuple:
     return branch, root
 
 
-def persist_gateway_session_cwd_to_db(session_key: str, cwd: str) -> None:
+def persist_gateway_session_cwd_to_db(session_key: str, cwd: str, probe_git: bool = True) -> None:
     """Dual-write a gateway session's cwd to ``state.db`` (best-effort).
 
     The in-memory ``record_session_cwd`` above keeps the durable cwd out of
@@ -1318,23 +1326,42 @@ def persist_gateway_session_cwd_to_db(session_key: str, cwd: str) -> None:
     by ``cwd``/``git_repo_root``, and only CLI/TUI persisted it so far —
     gateway chats always grouped under the launch dir. See ``#29531``.
 
+    Ownership is fenced to the EXACT durable session that commissioned this
+    terminal effect: ``HERMES_SESSION_ID`` is bound task-local (and copied
+    into executor threads) by ``gateway.session_context``, and unlike a
+    ``session_key`` it is never reused across a /new reset. Writing through
+    the stable routing key instead would let a stale effect from a reset
+    conversation re-home its successor before the successor ran anything.
+    ``update_session_cwd`` no-ops when the owner row is gone, so a late
+    completion from a closed session is simply dropped.
+
     Scope guard: only ``agent:``-prefixed keys. CLI keys collapse to
     ``"default"`` (or ``cli:…``) and TUI persists through its own turn-
     boundary path; letting either through here would double-write.
+
+    ``probe_git=False`` skips the git subprocess probe (callers that know
+    the cwd did not move — the probe is only needed to capture a fresh repo
+    identity, and the DB write preserves the previous one).
 
     Never raises: a DB write failure must not fail the user's command.
     """
     if not session_key or not str(session_key).startswith("agent:"):
         return
     try:
+        from gateway.session_context import get_session_env
         from hermes_state import SessionDB
         from hermes_cli.config import get_hermes_home
 
-        git_branch, git_repo_root = _probe_git_meta(cwd)
+        session_id = get_session_env("HERMES_SESSION_ID")
+        if not session_id:
+            return
+        git_branch = git_repo_root = None
+        if probe_git:
+            git_branch, git_repo_root = _probe_git_meta(cwd)
         db = SessionDB(db_path=Path(get_hermes_home()) / "state.db")
         try:
-            db.update_session_cwd_by_session_key(
-                session_key,
+            db.update_session_cwd(
+                session_id,
                 cwd,
                 git_branch=git_branch,
                 git_repo_root=git_repo_root,
@@ -3701,14 +3728,23 @@ def terminal_tool(
             # session into a directory the user never opened.
             if not workdir and (result or {}).get("cwd_observed"):
                 new_cwd = getattr(env, "cwd", None)
-                record_session_cwd(session_key, new_cwd)
+                # P2: the git probe runs two subprocesses with 2s timeouts —
+                # only pay it when the authoritative cwd actually moved.
+                # ``record_session_cwd`` returns the previous record so the
+                # first command of a session always persists, and later ones
+                # skip both the probe and the DB write while the session
+                # stays put.
+                prev_cwd = record_session_cwd(session_key, new_cwd)
+                cwd_moved = new_cwd != prev_cwd
                 # Gateway chats get the same durable persistence CLI/TUI
                 # already do, so the Projects sidebar can group them by
                 # project. Same guards as above: a transient workdir
                 # override or a command that never reported its cwd must
                 # not re-home the session row either.
                 if isinstance(new_cwd, str) and new_cwd.strip():
-                    persist_gateway_session_cwd_to_db(session_key, new_cwd)
+                    persist_gateway_session_cwd_to_db(
+                        session_key, new_cwd, probe_git=cwd_moved
+                    )
 
             # Extract output
             output = result.get("output", "")
